@@ -1,7 +1,7 @@
 import type { CallbackQueryContext, CommandContext, Context } from "grammy";
 import { InlineKeyboard } from "grammy";
 import { getTrendingMarkets } from "../limitless/api.js";
-import { buildMarketsList, marketLine } from "../format.js";
+import { buildMarketsList } from "../format.js";
 
 export async function handleMarkets(ctx: CommandContext<Context>): Promise<void> {
   const category = ctx.match?.trim() || undefined;
