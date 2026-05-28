@@ -1,0 +1,22 @@
+# Rust
+aomi-app/target/
+aomi-app/Cargo.lock
+
+# Node
+telegram-bot/node_modules/
+telegram-bot/dist/
+telegram-bot/.env
+
+# Database
+*.db
+*.db-shm
+*.db-wal
+
+# Env
+.env
+.env.local
+
+# Editor
+.vscode/
+.idea/
+*.swp
