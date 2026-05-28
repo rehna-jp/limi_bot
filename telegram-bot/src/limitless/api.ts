@@ -1,115 +1,156 @@
-const BASE = process.env.LIMITLESS_API_BASE ?? "https://api.limitless.exchange";
+import {
+  Client,
+  RateLimitError,
+  type MarketInterface,
+  type Market as MarketClass,
+  type OrderBook,
+  type CLOBPosition,
+  type AMMPosition,
+  type PortfolioPositionsResponse,
+} from "@limitless-exchange/sdk";
+import Bottleneck from "bottleneck";
 
-// ── Loose types — the Limitless API response shapes vary; we use optional
-//    chaining throughout to degrade gracefully rather than throw.
+// Use MarketInterface everywhere — it's the plain data shape that both
+// getActiveMarkets() (returns MarketInterface[]) and getMarket() (returns
+// Market class, which extends MarketInterface) satisfy.
+export type Market = MarketInterface;
+export type { OrderBook, CLOBPosition, AMMPosition };
 
-export interface Market {
-  slug: string;
-  title: string;
-  description?: string;
-  category?: string;
-  prices?: { yes?: string; no?: string };
-  outcomes?: string[];
-  volume24h?: number;
-  volume?: number;
-  expirationDate?: string;
-  expiration?: string;
-  liquidity?: number;
-  type?: string;
-}
+// ── Rate limiter ───────────────────────────────────────────────────────────
+// Max 2 concurrent requests, minimum 300ms between job starts.
 
-export interface OrderbookLevel {
-  price: string;
-  size: string;
-  side?: string;
-}
+const limiter = new Bottleneck({ maxConcurrent: 2, minTime: 300 });
 
-export interface Orderbook {
-  bids?: OrderbookLevel[];
-  asks?: OrderbookLevel[];
-  yes?: { bids?: OrderbookLevel[]; asks?: OrderbookLevel[] };
-  no?: { bids?: OrderbookLevel[]; asks?: OrderbookLevel[] };
-}
+const BASE_URL =
+  process.env.LIMITLESS_API_BASE ?? "https://api.limitless.exchange";
 
-export interface Position {
-  marketSlug?: string;
-  marketTitle?: string;
-  outcome?: string;
-  size?: number;
-  avgPrice?: number;
-  currentPrice?: number;
-  pnl?: number;
-  pnlPct?: number;
-  // CLOB shape
-  ctfBalance?: string;
-  averageFillPrice?: string;
-  costBasis?: string;
-  marketValue?: string;
-}
+const sdkClient = new Client({ baseURL: BASE_URL });
 
-export interface PositionsResponse {
-  clob?: Position[];
-  amm?: Position[];
-  positions?: Position[];
-}
+// ── Retry helper — one retry after 600ms on 429 ───────────────────────────
 
-async function get<T>(path: string): Promise<T> {
-  const res = await fetch(`${BASE}${path}`, {
-    headers: { "User-Agent": "Limi-Bot/0.1" },
-  });
-  if (!res.ok) {
-    const body = await res.text().catch(() => "");
-    throw new Error(`Limitless API ${path} → ${res.status}: ${body.slice(0, 200)}`);
+async function once<T>(fn: () => Promise<T>): Promise<T> {
+  try {
+    return await fn();
+  } catch (err) {
+    if (err instanceof RateLimitError) {
+      await sleep(600);
+      return fn();
+    }
+    throw err;
   }
-  return res.json() as Promise<T>;
 }
 
-// ── Public endpoints ───────────────────────────────────────────────────────
+function sleep(ms: number): Promise<void> {
+  return new Promise((r) => setTimeout(r, ms));
+}
+
+// ── Market data ───────────────────────────────────────────────────────────
 
 export async function getTrendingMarkets(
   limit = 10,
   category?: string
 ): Promise<Market[]> {
-  let path = `/markets/active?limit=${limit}&page=1`;
-  if (category) path += `&category=${encodeURIComponent(category)}`;
-  const res = await get<{ data?: Market[] } | Market[]>(path);
-  // Handle both { data: [...] } and bare array shapes.
-  if (Array.isArray(res)) return res;
-  if (Array.isArray((res as { data?: Market[] }).data))
-    return (res as { data: Market[] }).data;
-  return [];
-}
-
-export async function getMarket(slugOrAddress: string): Promise<Market> {
-  return get<Market>(`/markets/${encodeURIComponent(slugOrAddress)}`);
-}
-
-export async function getOrderbook(slug: string): Promise<Orderbook> {
-  return get<Orderbook>(
-    `/markets/${encodeURIComponent(slug)}/orderbook`
+  const cappedLimit = Math.min(limit, 25);
+  const res = await limiter.schedule(() =>
+    once(() => sdkClient.markets.getActiveMarkets({ limit: cappedLimit, page: 1 }))
   );
+  const markets: Market[] = res.data ?? [];
+  if (!category) return markets;
+  const q = category.toLowerCase();
+  return markets.filter(
+    (m) =>
+      m.categories?.some((c: string) => c.toLowerCase().includes(q)) ||
+      m.title?.toLowerCase().includes(q)
+  );
+}
+
+export async function getMarket(slug: string): Promise<Market> {
+  // getMarket() returns the Market class which extends MarketInterface.
+  return limiter.schedule(() =>
+    once(() => sdkClient.markets.getMarket(slug) as Promise<MarketClass>)
+  ) as Promise<Market>;
+}
+
+export async function getOrderbook(slug: string): Promise<OrderBook | null> {
+  try {
+    return await limiter.schedule(() =>
+      once(() => sdkClient.markets.getOrderBook(slug))
+    );
+  } catch {
+    // NegRisk group markets and some AMM markets don't have a CLOB orderbook.
+    return null;
+  }
+}
+
+// ── Public portfolio (no auth) ─────────────────────────────────────────────
+// SDK's PortfolioFetcher.getPositions() requires authentication.
+// The public endpoint accepts a wallet address with no credentials.
+
+export interface PublicPosition {
+  marketSlug?: string;
+  marketTitle?: string;
+  outcome?: string;
+  unrealizedPnl?: string | number;
+  costBasis?: string | number;
+  marketValue?: string | number;
+  pnlPct?: number;
+}
+
+export interface PublicPortfolioResponse {
+  clob?: PublicPosition[];
+  amm?: PublicPosition[];
+  positions?: PublicPosition[];
 }
 
 export async function getUserPositions(
   address: string
-): Promise<PositionsResponse> {
-  return get<PositionsResponse>(
-    `/public-portfolio/positions?address=${encodeURIComponent(address)}`
+): Promise<PublicPortfolioResponse> {
+  return limiter.schedule(() =>
+    once(async () => {
+      const res = await fetch(
+        `${BASE_URL}/public-portfolio/positions?address=${encodeURIComponent(address)}`,
+        { headers: { "User-Agent": "Limi-Bot/0.1" } }
+      );
+      if (res.status === 429) throw new RateLimitError("rate limited");
+      if (!res.ok) throw new Error(`positions ${res.status}`);
+      return res.json() as Promise<PublicPortfolioResponse>;
+    })
   );
 }
 
-// ── Price helpers ──────────────────────────────────────────────────────────
+// ── Price helpers ─────────────────────────────────────────────────────────
 
-/** Extract YES price (0-1) from a market object, trying common field shapes. */
+/** Best-effort YES price (0-1) from an SDK Market object. */
 export function yesPrice(market: Market): number | null {
-  const raw = market.prices?.yes ?? (market as unknown as Record<string, unknown>).yesPrice;
-  if (typeof raw === "string") return parseFloat(raw);
-  if (typeof raw === "number") return raw;
+  // SDK: prices[0] = YES, prices[1] = NO (0-1 range)
+  if (Array.isArray(market.prices) && market.prices[0] != null) {
+    return market.prices[0];
+  }
+  // Fallback: outcomes list
+  const yes = market.outcomes?.find(
+    (o) => o.title?.toUpperCase() === "YES"
+  );
+  if (yes?.price != null) return yes.price;
+  // Fallback: tradePrices midpoint
+  if (market.tradePrices) {
+    const buyYes = market.tradePrices.buy.market[0];
+    const sellYes = market.tradePrices.sell.market[0];
+    if (buyYes != null && sellYes != null) return (buyYes + sellYes) / 2;
+  }
   return null;
 }
 
-/** Combine all positions (CLOB + AMM) from a positions response. */
-export function allPositions(res: PositionsResponse): Position[] {
+/** Whether a market is a NegRisk group (has child markets, no direct orderbook). */
+export function isNegRiskGroup(market: Market): boolean {
+  return (
+    Array.isArray(market.markets) &&
+    market.markets.length > 0 &&
+    market.marketType === "NegRisk"
+  );
+}
+
+/** Combine all positions from a public portfolio response. */
+export function allPositions(res: PublicPortfolioResponse): PublicPosition[] {
   return [
     ...(res.clob ?? []),
     ...(res.amm ?? []),

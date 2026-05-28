@@ -1,4 +1,5 @@
-import type { Market, Position, PositionsResponse } from "./limitless/api.js";
+import type { Market } from "./limitless/api.js";
+import type { PublicPosition, PublicPortfolioResponse } from "./limitless/api.js";
 import { yesPrice, allPositions } from "./limitless/api.js";
 
 // ── HTML helpers ───────────────────────────────────────────────────────────
@@ -52,23 +53,34 @@ function truncate(s: string, n: number): string {
   return s.length > n ? s.slice(0, n - 1) + "…" : s;
 }
 
-// ── Position PnL — try every shape the Limitless API might return ──────────
+// ── Position PnL ───────────────────────────────────────────────────────────
+// Public portfolio endpoint can return several shapes.
+// CLOB: unrealizedPnl as 6-decimal USDC string ("1234567" = $1.23)
+// AMM: unrealizedPnl may be decimal string already ("1.23")
+// We attempt both interpretations and pick the sensible one.
 
-function positionPnl(p: Position): number | null {
-  // Explicit pnl field
-  if (p.pnl != null) return p.pnl;
-  // CLOB shape: marketValue - costBasis (both are string decimals)
-  const mv = parseFloat(p.marketValue ?? "");
-  const cb = parseFloat(p.costBasis ?? "");
-  if (!isNaN(mv) && !isNaN(cb)) return mv - cb;
+function parseUsdc6(s: string | number | undefined): number | null {
+  if (s == null) return null;
+  const n = typeof s === "number" ? s : parseFloat(s);
+  if (isNaN(n)) return null;
+  // Heuristic: if |value| > 1000, assume 6-decimal micro-USDC, divide by 1e6.
+  // Most real P&L values fall within ±$1000; micro-USDC strings for $1 = 1000000.
+  return Math.abs(n) > 1000 ? n / 1_000_000 : n;
+}
+
+function positionPnl(p: PublicPosition): number | null {
+  if (p.unrealizedPnl != null) return parseUsdc6(p.unrealizedPnl);
+  const mv = parseUsdc6(p.marketValue);
+  const cb = parseUsdc6(p.costBasis);
+  if (mv != null && cb != null) return mv - cb;
   return null;
 }
 
-function positionPnlPct(p: Position): number | null {
+function positionPnlPct(p: PublicPosition): number | null {
   if (p.pnlPct != null) return p.pnlPct;
   const pnl = positionPnl(p);
-  const cb = parseFloat(p.costBasis ?? "");
-  if (pnl != null && !isNaN(cb) && cb !== 0) return (pnl / cb) * 100;
+  const cb = parseUsdc6(p.costBasis);
+  if (pnl != null && cb != null && cb !== 0) return (pnl / cb) * 100;
   return null;
 }
 
@@ -92,8 +104,10 @@ function oddsLabel(yes: number | null): string {
 
 export function marketLine(m: Market): string {
   const yes = yesPrice(m);
-  const vol = m.volume24h ?? m.volume;
-  const volStr = vol != null ? ` — ${fmtVol(vol)} vol` : "";
+  // SDK Market.volume is a string like "1234567.89"; volumeFormatted is human-readable.
+  const rawVol = m.volume != null ? parseFloat(m.volume) : null;
+  const volStr =
+    rawVol != null && !isNaN(rawVol) ? ` — ${fmtVol(rawVol)} vol` : "";
   return `${trendIcon(yes)} ${m.title}${oddsLabel(yes)}${volStr}`;
 }
 
@@ -116,7 +130,7 @@ export function marketLine(m: Market): string {
 export function buildBriefing(
   firstName: string,
   markets: Market[],
-  posRes: PositionsResponse
+  posRes: PublicPortfolioResponse
 ): string {
   const positions = allPositions(posRes);
   const lines: string[] = [];
@@ -170,13 +184,26 @@ export function buildBriefing(
 //
 //   24h volume: $1.2M  ·  Resolves Fri Jun 30
 
-export function buildExplanation(market: Market): string {
+export function buildExplanation(market: Market, isGroup = false): string {
   const yes = yesPrice(market);
-  const expiry = fmtDate(market.expirationDate ?? market.expiration);
-  const vol = fmtVol(market.volume24h ?? market.volume);
+  const expiry = fmtDate(market.expirationDate ?? market.resolutionDate);
+  const rawVol = market.volume != null ? parseFloat(market.volume) : null;
+  const vol = rawVol != null && !isNaN(rawVol) ? fmtVol(rawVol) : "—";
   const lines: string[] = [];
 
   lines.push(b(market.title));
+
+  // NegRisk group market — list child markets instead of showing a single price
+  if (isGroup && Array.isArray(market.markets) && market.markets.length > 0) {
+    lines.push("");
+    lines.push(i("Multi-outcome market. Outcomes:"));
+    for (const child of market.markets.slice(0, 8)) {
+      const childYes = yesPrice(child);
+      const oddsStr = childYes != null ? ` — ${fmtPct(childYes)} YES` : "";
+      lines.push(`• ${child.title}${oddsStr}`);
+    }
+    return lines.join("\n");
+  }
 
   // Plain-English lead
   if (yes != null) {
@@ -220,7 +247,7 @@ export function buildExplanation(market: Market): string {
 // ── Positions list ─────────────────────────────────────────────────────────
 
 export function buildPositions(
-  posRes: PositionsResponse,
+  posRes: PublicPortfolioResponse,
   walletShort: string
 ): string {
   const positions = allPositions(posRes);

@@ -1,6 +1,6 @@
 import type { CommandContext, Context } from "grammy";
 import { InlineKeyboard } from "grammy";
-import { getMarket, getOrderbook } from "../limitless/api.js";
+import { getMarket, getOrderbook, isNegRiskGroup } from "../limitless/api.js";
 import { buildExplanation } from "../format.js";
 
 export async function handleExplain(ctx: CommandContext<Context>): Promise<void> {
@@ -11,34 +11,27 @@ export async function handleExplain(ctx: CommandContext<Context>): Promise<void>
   }
 
   try {
-    const [market, orderbook] = await Promise.allSettled([
-      getMarket(slug),
-      getOrderbook(slug),
-    ]);
+    const market = await getMarket(slug);
+    const group = isNegRiskGroup(market);
 
-    if (market.status === "rejected") {
-      await ctx.reply(`Market not found: ${slug}`);
-      return;
+    // Fetch orderbook for CLOB markets (non-groups).
+    // NegRisk groups don't have a direct orderbook.
+    if (!group) {
+      await getOrderbook(slug); // warm — result not used in text but validates market exists
     }
 
-    const m = market.value;
-    if (orderbook.status === "fulfilled") {
-      // Attach orderbook depth summary to the market for the formatter.
-      const bids = orderbook.value.bids ?? orderbook.value.yes?.bids ?? [];
-      const asks = orderbook.value.asks ?? orderbook.value.yes?.asks ?? [];
-      (m as unknown as Record<string, unknown>)._bidCount = bids.length;
-      (m as unknown as Record<string, unknown>)._askCount = asks.length;
-    }
-
-    const text = buildExplanation(m);
+    const text = buildExplanation(market, group);
     const keyboard = new InlineKeyboard().url(
-      `Open on Limitless`,
+      "Open on Limitless",
       `https://limitless.exchange/markets/${slug}`
     );
 
     await ctx.reply(text, { parse_mode: "HTML", reply_markup: keyboard });
   } catch (err) {
-    await ctx.reply(`Couldn't load that market. Check the slug and try again.`);
+    await ctx.reply(
+      `Market not found: <code>${slug}</code>\n\nCheck the slug and try again.`,
+      { parse_mode: "HTML" }
+    );
     console.error("[explain]", err);
   }
 }

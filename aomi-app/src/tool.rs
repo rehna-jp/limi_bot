@@ -81,7 +81,26 @@ impl DynAomiTool for ExplainMarket {
         rt.block_on(async move {
             let encoded = urlencode(&slug);
             let market = get(&format!("/markets/{encoded}")).await?;
-            // Orderbook may be absent for group/inactive markets — degrade gracefully.
+
+            // Detect NegRisk group markets (multi-outcome, no single orderbook).
+            // They have a `markets` array of child markets.
+            let is_group = market
+                .get("markets")
+                .and_then(|v| v.as_array())
+                .map(|arr| !arr.is_empty())
+                .unwrap_or(false);
+
+            if is_group {
+                return Ok(json!({
+                    "market": market,
+                    "market_type": "NegRisk_group",
+                    "note": "This is a multi-outcome group market. \
+                             Use the child market slugs in the `markets` array \
+                             to explain or watch individual outcomes.",
+                }));
+            }
+
+            // CLOB leaf market — fetch orderbook (sequential, rate-gated).
             let orderbook = get(&format!("/markets/{encoded}/orderbook"))
                 .await
                 .unwrap_or_else(|_| json!({"bids": [], "asks": [], "note": "orderbook unavailable"}));
@@ -204,15 +223,18 @@ impl DynAomiTool for DailyBriefing {
         let count = args.market_count.unwrap_or(5).min(20);
         let rt = rt()?;
         rt.block_on(async move {
+            // Sequential calls — never concurrent — to respect the 2-request
+            // concurrency limit and 300ms minimum spacing enforced by `get()`.
             let markets = get(&format!("/markets/active?limit={count}&page=1"))
                 .await
                 .unwrap_or_else(|e| json!({"error": e}));
+            // Rate gate between the two calls is handled inside `get()`.
             let positions = get(&format!(
                 "/public-portfolio/positions?address={}",
                 urlencode(&address)
             ))
             .await
-            .unwrap_or_else(|_| json!({"positions": [], "clob": [], "amm": []}));
+            .unwrap_or_else(|_| json!({"clob": [], "amm": []}));
             Ok(json!({
                 "trending_markets": markets,
                 "positions": positions,

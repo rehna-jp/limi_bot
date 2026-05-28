@@ -9,7 +9,9 @@
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
+    "@limitless-exchange/sdk": "^1.0.11",
     "better-sqlite3": "^9.6.0",
+    "bottleneck": "^2.19.5",
     "dotenv": "^16.4.5",
     "grammy": "^1.27.0",
     "node-cron": "^3.0.3",

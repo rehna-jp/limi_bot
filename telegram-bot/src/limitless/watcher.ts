@@ -1,4 +1,9 @@
-import { io, type Socket } from "socket.io-client";
+import {
+  Client,
+  type WebSocketClient,
+  type OrderbookUpdate,
+  type NewPriceData,
+} from "@limitless-exchange/sdk";
 import { Bot } from "grammy";
 import {
   getActiveWatches,
@@ -7,106 +12,105 @@ import {
 } from "../db/index.js";
 import { fmtPct } from "../format.js";
 
-const WS_URL = "wss://ws.limitless.exchange";
-const RECONNECT_BASE_MS = 1_000;
+const BASE_URL =
+  process.env.LIMITLESS_API_BASE ?? "https://api.limitless.exchange";
+
+const RECONNECT_BASE_MS = 2_000;
 const RECONNECT_MAX_MS = 60_000;
-
-interface PriceData {
-  marketAddress?: string;
-  updatedPrices?: { yes?: string; no?: string };
-}
-
-interface OrderbookUpdate {
-  marketSlug?: string;
-  orderbook?: {
-    yes?: { bids?: Array<{ price: string }>; asks?: Array<{ price: string }> };
-    bids?: Array<{ price: string }>;
-    asks?: Array<{ price: string }>;
-  };
-}
-
-function bestYesPrice(update: OrderbookUpdate): number | null {
-  // Try CLOB orderbook shape: yes asks (best ask = current price to buy YES)
-  const yesAsks =
-    update.orderbook?.yes?.asks ??
-    update.orderbook?.asks;
-  if (yesAsks && yesAsks.length > 0) {
-    return parseFloat(yesAsks[0].price);
-  }
-  return null;
-}
+const RESYNC_INTERVAL_MS = 30_000;
 
 export function startWatcher(bot: Bot): void {
+  let ws: WebSocketClient | null = null;
   let reconnectDelay = RECONNECT_BASE_MS;
-  let socket: Socket | null = null;
+  // slug → set of watch ids subscribed via marketSlugs
   const subscribedSlugs = new Set<string>();
+  // address → set of watch ids subscribed via marketAddresses
+  const subscribedAddresses = new Set<string>();
+
+  function buildClient(): WebSocketClient {
+    const sdkClient = new Client({ baseURL: BASE_URL });
+    return sdkClient.newWebSocketClient();
+  }
 
   function connect(): void {
-    socket = io(WS_URL, {
-      path: "/socket.io",
-      transports: ["websocket"],
-      reconnection: false, // we handle reconnect ourselves with backoff
-    });
+    ws = buildClient();
 
-    socket.on("connect", () => {
+    ws.on("connect", () => {
       console.log("[watcher] connected");
       reconnectDelay = RECONNECT_BASE_MS;
       subscribedSlugs.clear();
-      subscribeActiveWatches();
+      subscribedAddresses.clear();
+      subscribeActiveWatches().catch((e) =>
+        console.error("[watcher] initial subscribe error:", e)
+      );
     });
 
-    socket.on("disconnect", (reason: string) => {
-      console.log(`[watcher] disconnected: ${reason}. Reconnecting in ${reconnectDelay}ms`);
+    ws.on("disconnect", () => {
+      console.log(`[watcher] disconnected — reconnecting in ${reconnectDelay}ms`);
       scheduleReconnect();
     });
 
-    socket.on("connect_error", (err: Error) => {
-      console.error(`[watcher] connection error: ${err.message}. Retry in ${reconnectDelay}ms`);
-      scheduleReconnect();
-    });
-
-    socket.on("orderbookUpdate", async (data: OrderbookUpdate) => {
+    ws.on("orderbookUpdate", (data: OrderbookUpdate) => {
+      // CLOB market: YES price = adjustedMidpoint from the orderbook
       const slug = data.marketSlug;
-      if (!slug) return;
-      const price = bestYesPrice(data);
-      if (price == null) return;
-      await checkAndAlert(slug, price);
+      const price = data.orderbook?.adjustedMidpoint;
+      if (!slug || price == null) return;
+      void checkAndAlert(slug, price, null);
     });
 
-    socket.on("newPriceData", async (data: PriceData) => {
-      // AMM price update — keyed by address, not slug.
-      // We match by the address we subscribed with if applicable.
-      const rawYes = data.updatedPrices?.yes;
-      if (!rawYes) return;
-      const price = parseFloat(rawYes);
-      // Best effort: check all active watches against this price.
-      // For CLOB-only Limitless, this path is rarely hit.
-      const watches = getActiveWatches();
-      for (const w of watches) {
-        await checkAndAlert(w.market_slug, price, w);
+    ws.on("newPriceData", (data: NewPriceData) => {
+      // AMM market: keyed by marketAddress; iterate all price entries
+      for (const entry of data.updatedPrices ?? []) {
+        if (entry.yesPrice == null) continue;
+        void checkAndAlert(null, entry.yesPrice, entry.marketAddress);
       }
     });
   }
 
-  function subscribeActiveWatches(): void {
+  async function subscribeActiveWatches(): Promise<void> {
+    if (!ws) return;
     const watches = getActiveWatches();
-    for (const w of watches) {
-      subscribeSlug(w.market_slug);
+    const newSlugs = watches
+      .filter((w) => w.market_type !== "AMM" && !subscribedSlugs.has(w.market_slug))
+      .map((w) => w.market_slug);
+    const newAddrs = watches
+      .filter(
+        (w) =>
+          w.market_type === "AMM" &&
+          w.market_address &&
+          !subscribedAddresses.has(w.market_address)
+      )
+      .map((w) => w.market_address as string);
+
+    try {
+      if (newSlugs.length > 0) {
+        await ws.subscribe("subscribe_market_prices", {
+          marketSlugs: newSlugs,
+        });
+        newSlugs.forEach((s) => subscribedSlugs.add(s));
+      }
+      if (newAddrs.length > 0) {
+        await ws.subscribe("subscribe_market_prices", {
+          marketAddresses: newAddrs,
+        });
+        newAddrs.forEach((a) => subscribedAddresses.add(a));
+      }
+    } catch (err) {
+      console.error("[watcher] subscribe error:", err);
     }
   }
 
-  function subscribeSlug(slug: string): void {
-    if (subscribedSlugs.has(slug) || !socket?.connected) return;
-    socket.emit("subscribe_market_prices", { slug });
-    subscribedSlugs.add(slug);
-  }
-
   async function checkAndAlert(
-    slug: string,
+    slug: string | null,
     currentPrice: number,
-    hint?: Watch
+    address: string | null
   ): Promise<void> {
-    const watches = getActiveWatches().filter((w) => w.market_slug === slug);
+    const watches = getActiveWatches().filter((w) => {
+      if (slug) return w.market_slug === slug;
+      if (address) return w.market_address === address;
+      return false;
+    });
+
     for (const watch of watches) {
       const baseline = watch.last_seen_odds;
       if (baseline == null) {
@@ -114,41 +118,41 @@ export function startWatcher(bot: Bot): void {
         continue;
       }
       const drift = Math.abs(currentPrice - baseline) * 100;
-      if (drift >= watch.threshold_pct) {
-        const direction = currentPrice > baseline ? "▲ up" : "▼ down";
-        const msg =
-          `🔔 <b>Odds alert</b>\n\n` +
-          `<code>${slug}</code>\n` +
-          `YES moved <b>${direction} ${drift.toFixed(1)}pp</b>\n` +
-          `${fmtPct(baseline)} → ${fmtPct(currentPrice)}\n\n` +
-          `<a href="https://limitless.exchange/markets/${slug}">Open on Limitless</a>`;
+      if (drift < watch.threshold_pct) continue;
 
-        try {
-          await bot.api.sendMessage(watch.telegram_id, msg, {
-            parse_mode: "HTML",
-          });
-          updateLastSeenOdds(watch.id, currentPrice);
-        } catch (err) {
-          console.error(`[watcher] failed to notify ${watch.telegram_id}:`, err);
-        }
+      const direction = currentPrice > baseline ? "▲ up" : "▼ down";
+      const displaySlug = watch.market_slug;
+      const msg =
+        `🔔 <b>Odds alert</b>\n\n` +
+        `<code>${displaySlug}</code>\n` +
+        `YES moved <b>${direction} ${drift.toFixed(1)}pp</b>\n` +
+        `${fmtPct(baseline)} → ${fmtPct(currentPrice)}\n\n` +
+        `<a href="https://limitless.exchange/markets/${displaySlug}">Open on Limitless</a>`;
+
+      try {
+        await bot.api.sendMessage(watch.telegram_id, msg, {
+          parse_mode: "HTML",
+        });
+        updateLastSeenOdds(watch.id, currentPrice);
+      } catch (err) {
+        console.error(`[watcher] notify ${watch.telegram_id}:`, err);
       }
     }
   }
 
   function scheduleReconnect(): void {
-    socket?.removeAllListeners();
-    socket?.disconnect();
-    socket = null;
-    setTimeout(() => {
-      connect();
-    }, reconnectDelay);
+    ws?.disconnect?.();
+    ws = null;
+    setTimeout(() => connect(), reconnectDelay);
     reconnectDelay = Math.min(reconnectDelay * 2, RECONNECT_MAX_MS);
   }
 
-  // Re-subscribe new watches every 30 seconds (picks up /watch commands).
+  // Re-subscribe new watches every 30 seconds.
   setInterval(() => {
-    subscribeActiveWatches();
-  }, 30_000);
+    subscribeActiveWatches().catch((e) =>
+      console.error("[watcher] resync error:", e)
+    );
+  }, RESYNC_INTERVAL_MS);
 
   connect();
 }

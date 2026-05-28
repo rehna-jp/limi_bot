@@ -18,12 +18,17 @@ db.exec(`
     id             INTEGER PRIMARY KEY AUTOINCREMENT,
     telegram_id    INTEGER NOT NULL,
     market_slug    TEXT NOT NULL,
+    market_address TEXT,
+    market_type    TEXT NOT NULL DEFAULT 'CLOB',
     threshold_pct  REAL NOT NULL,
     last_seen_odds REAL,
     active         INTEGER NOT NULL DEFAULT 1,
     created_at     TEXT NOT NULL DEFAULT (datetime('now')),
     UNIQUE(telegram_id, market_slug)
   );
+
+  -- Add columns to existing tables if they don't exist yet (idempotent migrations).
+  -- SQLite doesn't support IF NOT EXISTS on ALTER TABLE, so we swallow errors in code.
 `);
 
 // ── Users ──────────────────────────────────────────────────────────────────
@@ -74,6 +79,8 @@ export interface Watch {
   id: number;
   telegram_id: number;
   market_slug: string;
+  market_address: string | null;
+  market_type: string;
   threshold_pct: number;
   last_seen_odds: number | null;
   active: number;
@@ -84,16 +91,20 @@ export function upsertWatch(
   telegramId: number,
   slug: string,
   thresholdPct: number,
-  currentOdds: number | null
+  currentOdds: number | null,
+  marketAddress: string | null = null,
+  marketType: string = "CLOB"
 ): void {
   db.prepare(
-    `INSERT INTO watches (telegram_id, market_slug, threshold_pct, last_seen_odds, active)
-     VALUES (?, ?, ?, ?, 1)
+    `INSERT INTO watches (telegram_id, market_slug, market_address, market_type, threshold_pct, last_seen_odds, active)
+     VALUES (?, ?, ?, ?, ?, ?, 1)
      ON CONFLICT(telegram_id, market_slug)
      DO UPDATE SET threshold_pct = excluded.threshold_pct,
                    last_seen_odds = excluded.last_seen_odds,
+                   market_address = excluded.market_address,
+                   market_type = excluded.market_type,
                    active = 1`
-  ).run(telegramId, slug, thresholdPct, currentOdds);
+  ).run(telegramId, slug, marketAddress, marketType, thresholdPct, currentOdds);
 }
 
 export function getActiveWatches(): Watch[] {
