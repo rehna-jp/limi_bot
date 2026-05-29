@@ -1,3 +1,4 @@
+import axios from "axios";
 import {
   Client,
   RateLimitError,
@@ -107,13 +108,24 @@ export async function getUserPositions(
 ): Promise<PublicPortfolioResponse> {
   return limiter.schedule(() =>
     once(async () => {
-      const res = await fetch(
-        `${BASE_URL}/public-portfolio/positions?address=${encodeURIComponent(address)}`,
-        { headers: { "User-Agent": "Limi-Bot/0.1" } }
-      );
-      if (res.status === 429) throw new RateLimitError("rate limited");
-      if (!res.ok) throw new Error(`positions ${res.status}`);
-      return res.json() as Promise<PublicPortfolioResponse>;
+      try {
+        const res = await axios.get<PublicPortfolioResponse>(
+          `${BASE_URL}/public-portfolio/positions`,
+          {
+            params: { address },
+            headers: { "User-Agent": "Limi-Bot/0.1" },
+            timeout: 10_000,
+          }
+        );
+        return res.data;
+      } catch (err) {
+        if (axios.isAxiosError(err)) {
+          if (err.response?.status === 429) throw new RateLimitError("rate limited");
+          // 404 = wallet has no positions on Limitless
+          if (err.response?.status === 404) return {} as PublicPortfolioResponse;
+        }
+        throw err;
+      }
     })
   );
 }

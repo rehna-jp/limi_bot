@@ -20,7 +20,7 @@ A Telegram bot that keeps prediction market traders ahead of the action on [Limi
 
 ## Demo
 
-Try it: [@uselimi\_bot](https://t.me/uselimi_bot) _(link active after activation)_
+Try it: [@limi\_app\_bot](https://t.me/limi_app_bot)
 
 ---
 
@@ -132,7 +132,7 @@ limi/
 
 ## Links
 
-- Demo bot: [@uselimi\_bot](https://t.me/uselimi_bot)
+- Demo bot: [@limi\_app\_bot](https://t.me/limi_app_bot)
 - GitHub: [rehna-jp/limi\_bot](https://github.com/rehna-jp/limi_bot)
 - Limitless Exchange: [limitless.exchange](https://limitless.exchange)
 - Aomi: [chat.aomi.dev](https://chat.aomi.dev)

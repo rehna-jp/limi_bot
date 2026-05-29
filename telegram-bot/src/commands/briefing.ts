@@ -17,10 +17,13 @@ export async function handleBriefing(ctx: CommandContext<Context>): Promise<void
   await ctx.reply("Fetching your brief…");
 
   try {
-    const [markets, positions] = await Promise.all([
-      getTrendingMarkets(5),
-      getUserPositions(user.wallet_address),
-    ]);
+    // Sequential fetch avoids simultaneous TLS connections to the same host
+    // which can cause ETIMEDOUT in some network environments (e.g. WSL2).
+    const markets = await getTrendingMarkets(5);
+    const positions = await getUserPositions(user.wallet_address).catch((err) => {
+      console.error("[briefing] positions fetch failed, continuing without:", err.message);
+      return {};
+    });
 
     const firstName = ctx.from?.first_name ?? "trader";
     const text = buildBriefing(firstName, markets, positions);

@@ -108,7 +108,8 @@ export function marketLine(m: Market): string {
   const rawVol = m.volume != null ? parseFloat(m.volume) : null;
   const volStr =
     rawVol != null && !isNaN(rawVol) ? ` — ${fmtVol(rawVol)} vol` : "";
-  return `${trendIcon(yes)} ${m.title}${oddsLabel(yes)}${volStr}`;
+  const slugStr = m.slug ? `\n   <code>${m.slug}</code>` : "";
+  return `${trendIcon(yes)} ${m.title}${oddsLabel(yes)}${volStr}${slugStr}`;
 }
 
 // ── Morning briefing ───────────────────────────────────────────────────────
