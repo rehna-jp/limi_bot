@@ -20,3 +20,6 @@ telegram-bot/.env
 .vscode/
 .idea/
 *.swp
+
+# Aomi deploy state
+.aomi/
